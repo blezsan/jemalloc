@@ -95,6 +95,8 @@ struct prof_tctx_s {
 	 * dump_mtx.
 	 */
 	prof_cnt_t		dump_cnts;
+
+  ql_head(prof_log_t)  log;
 };
 typedef rb_tree(prof_tctx_t) prof_tctx_tree_t;
 
@@ -103,6 +105,12 @@ struct prof_info_s {
 	nstime_t		alloc_time;
 	/* Points to the prof_tctx_t corresponding to the allocation. */
 	prof_tctx_t		*alloc_tctx;
+};
+
+struct prof_log_s {
+  const void    *start;
+  size_t  size;
+  ql_elm(prof_log_t)  log_link;
 };
 
 struct prof_gctx_s {

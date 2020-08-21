@@ -441,7 +441,7 @@ expect_iter_results_at(fb_group_t *fb, size_t nbits, size_t pos,
     bool val, bool forward) {
 	bool iter_res;
 	size_t iter_begin;
-	size_t iter_len;
+	size_t iter_len = 0;
 	if (val) {
 		if (forward) {
 			iter_res = fb_srange_iter(fb, nbits, pos,
@@ -462,7 +462,7 @@ expect_iter_results_at(fb_group_t *fb, size_t nbits, size_t pos,
 
 	bool simple_iter_res;
 	size_t simple_iter_begin;
-	size_t simple_iter_len;
+	size_t simple_iter_len = 0;
 	simple_iter_res = fb_iter_simple(fb, nbits, pos, &simple_iter_begin,
 	    &simple_iter_len, val, forward);
 

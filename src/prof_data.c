@@ -372,6 +372,7 @@ prof_lookup(tsd_t *tsd, prof_bt_t *bt) {
 		ret.p->tctx_uid = tdata->tctx_uid_next++;
 		ret.p->prepared = true;
 		ret.p->state = prof_tctx_state_initializing;
+    ql_new(&ret.p->log);
 		malloc_mutex_lock(tsd_tsdn(tsd), tdata->lock);
 		error = ckh_insert(tsd, &tdata->bt2tctx, btkey, ret.v);
 		malloc_mutex_unlock(tsd_tsdn(tsd), tdata->lock);
@@ -717,9 +718,13 @@ struct prof_dump_iter_arg_s {
 	void *cbopaque;
 };
 
+static bitmap_t *swap_pages;
+static bitmap_info_t swap_pages_info;
+
 static prof_tctx_t *
 prof_tctx_dump_iter(prof_tctx_tree_t *tctxs, prof_tctx_t *tctx, void *opaque) {
 	prof_dump_iter_arg_t *arg = (prof_dump_iter_arg_t *)opaque;
+  prof_log_t *log;
 	malloc_mutex_assert_owner(arg->tsdn, tctx->gctx->lock);
 
 	switch (tctx->state) {
@@ -733,6 +738,12 @@ prof_tctx_dump_iter(prof_tctx_tree_t *tctxs, prof_tctx_t *tctx, void *opaque) {
 		    "  t%"FMTu64": ", tctx->thr_uid);
 		prof_dump_print_cnts(arg->prof_dump_write, arg->cbopaque,
 		    &tctx->dump_cnts);
+    for (log = ql_first(&tctx->log); log != NULL; log = ql_next(&tctx->log, log, log_link)) {
+      prof_dump_printf(arg->prof_dump_write, arg->cbopaque,
+          " [%"FMTxPTR": %"FMTu64" swapped %d]",
+          (size_t)log->start, log->size,
+          bitmap_get(swap_pages, &swap_pages_info, (size_t)log->start / sysconf(_SC_PAGE_SIZE)));
+    }
 		arg->prof_dump_write(arg->cbopaque, "\n");
 		break;
 	default:
@@ -1015,6 +1026,169 @@ prof_gctx_dump_iter(prof_gctx_tree_t *gctxs, prof_gctx_t *gctx, void *opaque) {
 	return NULL;
 }
 
+
+typedef struct {
+    uint64_t pfn : 54;
+    unsigned int soft_dirty : 1;
+    unsigned int file_page : 1;
+    unsigned int swapped : 1;
+    unsigned int present : 1;
+} PagemapEntry;
+
+/* Parse the pagemap entry for the given virtual address.
+ *
+ * @param[out] entry      the parsed entry
+ * @param[in]  pagemap_fd file descriptor to an open /proc/pid/pagemap file
+ * @param[in]  vaddr      virtual address to get entry for
+ * @return 0 for success, 1 for failure
+ */
+int pagemap_get_entry(PagemapEntry *entry, int pagemap_fd, uintptr_t vaddr)
+{
+        size_t nread;
+        ssize_t ret;
+        uint64_t data;
+
+        nread = 0;
+        while (nread < sizeof(data)) {
+                ret = pread(pagemap_fd, &data, sizeof(data),
+                                (vaddr / sysconf(_SC_PAGE_SIZE)) * sizeof(data) + nread);
+                nread += ret;
+                if (ret <= 0) {
+                        return 1;
+                }
+        }
+        entry->pfn = data & (((uint64_t)1 << 54) - 1);
+        entry->soft_dirty = (data >> 54) & 1;
+        entry->file_page = (data >> 61) & 1;
+        entry->swapped = (data >> 62) & 1;
+        entry->present = (data >> 63) & 1;
+        return 0;
+}
+
+/* Convert the given virtual address to physical using /proc/PID/pagemap.
+ *
+ * @param[out] paddr physical address
+ * @param[in]  pid   process to convert for
+ * @param[in] vaddr virtual address to get entry for
+ * @return 0 for success, 1 for failure
+ */
+int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr)
+{
+        char pagemap_file[BUFSIZ];
+        int pagemap_fd;
+
+        snprintf(pagemap_file, sizeof(pagemap_file), "/proc/%ju/pagemap", (uintmax_t)pid);
+        pagemap_fd = open(pagemap_file, O_RDONLY);
+        if (pagemap_fd < 0) {
+                return 1;
+        }
+        PagemapEntry entry;
+        if (pagemap_get_entry(&entry, pagemap_fd, vaddr)) {
+                return 1;
+        }
+        close(pagemap_fd);
+        *paddr = (entry.pfn * sysconf(_SC_PAGE_SIZE)) + (vaddr % sysconf(_SC_PAGE_SIZE));
+        return 0;
+}
+
+int prof_dump_find_swap_pages(tsd_t *tsd) {
+  char buffer[BUFSIZ];
+  char maps_file[BUFSIZ];
+  char pagemap_file[BUFSIZ];
+  int maps_fd;
+  int offset = 0;
+  int pagemap_fd;
+  pid_t pid;
+  size_t nbits;
+
+  nbits = 1 + ((size_t)sbrk(0) / sysconf(_SC_PAGE_SIZE));
+  bitmap_info_init(&swap_pages_info, nbits);
+  swap_pages = iallocztm(tsd_tsdn(tsd), BITMAP_GROUPS(nbits),
+    sz_size2index(BITMAP_GROUPS(nbits)), false, NULL, true,
+    arena_ichoose(tsd, NULL), true);
+  bitmap_init(swap_pages, &swap_pages_info, 0);
+  pid = getpid();
+  snprintf(maps_file, sizeof(maps_file), "/proc/%ju/maps", (uintmax_t)pid);
+  snprintf(pagemap_file, sizeof(pagemap_file), "/proc/%ju/pagemap", (uintmax_t)pid);
+  maps_fd = open(maps_file, O_RDONLY);
+  if (maps_fd < 0) {
+    /* perror("open maps"); */
+    return ENOENT;
+  }
+  pagemap_fd = open(pagemap_file, O_RDONLY);
+  if (pagemap_fd < 0) {
+    /* perror("open pagemap"); */
+    return ENOENT;
+  }
+  for (;;) {
+    ssize_t length = read(maps_fd, buffer + offset, sizeof buffer - offset);
+    if (length <= 0) break;
+    length += offset;
+    for (size_t i = offset; i < (size_t)length; i++) {
+      uintptr_t low = 0, high = 0;
+      if (buffer[i] == '\n' && i) {
+        size_t y;
+        /* Parse a line from maps. Each line contains a range that contains many pages. */
+        {
+          size_t x = i - 1;
+          while (x && buffer[x] != '\n') x--;
+          if (buffer[x] == '\n') x++;
+          // size_t beginning = x;
+          while (buffer[x] != '-' && x < sizeof buffer) {
+            char c = buffer[x++];
+            low *= 16;
+            if (c >= '0' && c <= '9') {
+              low += c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+              low += c - 'a' + 10;
+            } else {
+              break;
+            }
+          }
+          while (buffer[x] != '-' && x < sizeof buffer) x++;
+          if (buffer[x] == '-') x++;
+          while (buffer[x] != ' ' && x < sizeof buffer) {
+            char c = buffer[x++];
+            high *= 16;
+            if (c >= '0' && c <= '9') {
+              high += c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+              high += c - 'a' + 10;
+            } else {
+              break;
+            }
+          }
+          for (int field = 0; field < 4; field++) {
+            x++;
+            while(buffer[x] != ' ' && x < sizeof buffer) x++;
+          }
+          while (buffer[x] == ' ' && x < sizeof buffer) x++;
+          y = x;
+          while (buffer[y] != '\n' && y < sizeof buffer) y++;
+          buffer[y] = 0;
+        }
+        /* Get info about all pages in this page range with pagemap. */
+        {
+          PagemapEntry entry;
+          for (uintptr_t addr = low; addr < high; addr += sysconf(_SC_PAGE_SIZE)) {
+            /* TODO always fails for the last page (vsyscall), why? pread returns 0. */
+            if (!pagemap_get_entry(&entry, pagemap_fd, addr)) {
+              // only print swapped pages
+              if (entry.swapped == 1 && addr / sysconf(_SC_PAGE_SIZE) < nbits) {
+                bitmap_set(swap_pages, &swap_pages_info, addr / sysconf(_SC_PAGE_SIZE));
+              }
+            }
+          }
+        }
+        buffer[y] = '\n';
+      }
+    }
+  }
+  close(maps_fd);
+  close(pagemap_fd);
+  return 0;
+}
+
 static void
 prof_dump_prep(tsd_t *tsd, prof_tdata_t *tdata, prof_cnt_t *cnt_all,
     size_t *leak_ngctx, prof_gctx_tree_t *gctxs) {
@@ -1023,6 +1197,8 @@ prof_dump_prep(tsd_t *tsd, prof_tdata_t *tdata, prof_cnt_t *cnt_all,
 		prof_gctx_t	*p;
 		void		*v;
 	} gctx;
+
+  prof_dump_find_swap_pages(tsd);
 
 	prof_enter(tsd, tdata);
 

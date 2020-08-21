@@ -10,7 +10,7 @@ from subprocess import call
 # checking this is flaky on OS X.
 bits_64 = sys.maxsize > 2**32
 
-nparallel = cpu_count() * 2
+nparallel = 4
 
 uname = uname()[0]
 

@@ -125,6 +125,10 @@ prof_alloc_rollback(tsd_t *tsd, prof_tctx_t *tctx) {
 void
 prof_malloc_sample_object(tsd_t *tsd, const void *ptr, size_t size,
     size_t usize, prof_tctx_t *tctx) {
+  union {
+    prof_log_t *p;
+    void    *v;
+  } ret;
 	if (opt_prof_sys_thread_name) {
 		prof_sys_thread_name_fetch(tsd);
 	}
@@ -134,6 +138,13 @@ prof_malloc_sample_object(tsd_t *tsd, const void *ptr, size_t size,
 	prof_info_set(tsd, edata, tctx);
 
 	szind_t szind = sz_size2index(size);
+
+  ret.v = iallocztm(tsd_tsdn(tsd), sizeof(prof_log_t),
+      sz_size2index(sizeof(prof_log_t)), false, NULL, true,
+      arena_ichoose(tsd, NULL), true);
+  ql_elm_new(ret.p, log_link);
+  ret.p->start = ptr;
+  ret.p->size = size;
 
 	malloc_mutex_lock(tsd_tsdn(tsd), tctx->tdata->lock);
 	/*
@@ -158,6 +169,9 @@ prof_malloc_sample_object(tsd_t *tsd, const void *ptr, size_t size,
 		tctx->cnts.accumbytes += usize;
 		tctx->cnts.accumbytes_unbiased += unbiased_bytes;
 	}
+
+  ql_tail_insert(&tctx->log, ret.p, log_link);
+
 	bool record_recent = prof_recent_alloc_prepare(tsd, tctx);
 	tctx->prepared = false;
 	malloc_mutex_unlock(tsd_tsdn(tsd), tctx->tdata->lock);
